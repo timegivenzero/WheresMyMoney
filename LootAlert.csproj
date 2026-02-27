@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>LootAlert</AssemblyName>
+    <RootNamespace>LootAlert</RootNamespace>
+    <Nullable>enable</Nullable>
+    <Platforms>x64</Platforms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Optimize>true</Optimize>
+    <!-- Path to your ExileApi root folder -->
+    <ExileApiRoot>C:\exilecore\poe1\ExileApi-Compiled-master</ExileApiRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="ExileCore">
+      <HintPath>$(ExileApiRoot)\ExileCore.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="GameOffsets">
+      <HintPath>$(ExileApiRoot)\GameOffsets.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ImGui.NET">
+      <HintPath>$(ExileApiRoot)\ImGui.NET.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SharpDX.Mathematics">
+      <HintPath>$(ExileApiRoot)\SharpDX.Mathematics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+
+</Project>
