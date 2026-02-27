@@ -1,4 +1,4 @@
-# LootAlert - ExileAPI Plugin
+# Wheres My Money - ExileAPI Plugin
 
 A ground loot overlay for Path of Exile that shows you what's on the floor, 
 prices everything via poe.ninja, and tallies your currency per map.
@@ -15,7 +15,7 @@ prices everything via poe.ninja, and tallies your currency per map.
 
 ## Installation
 
-1. Drop the `LootAlert` folder into your `Plugins/Source/` directory.
+1. Drop the `Wheres-My-Money` folder into your `Plugins/Source/` directory.
 2. Reload plugins in ExileAPI.
 3. Enable the plugin and set your league name in Settings (default: **Keepers**).
 
@@ -52,6 +52,7 @@ prices everything via poe.ninja, and tallies your currency per map.
 ## Notes
 
 - Prices are fetched from poe.ninja. Items not on poe.ninja show 0c.
+- Prices fetched from poe.ninja can vary and might be inaccurate at times.
 - The plugin detects pickups by watching for items that disappear from the ground.
   In very rare cases a dropped item despawning could be counted as a pickup.
 - The map tally resets when you change area.
