@@ -56,3 +56,6 @@ prices everything via poe.ninja, and tallies your currency per map.
 - The plugin detects pickups by watching for items that disappear from the ground.
   In very rare cases a dropped item despawning could be counted as a pickup.
 - The map tally resets when you change area.
+https://i.imgur.com/sz2CrjM.png
+https://i.imgur.com/7VaiX0U.png
+https://i.imgur.com/cWq7h9b.png
