@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace LootAlert
+namespace WheresMyMoney
 {
     /// <summary>
     /// Tracks currency items picked up during the current map session.

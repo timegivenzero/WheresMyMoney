@@ -4,7 +4,7 @@ using System.Net.Http;
 using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 
-namespace LootAlert
+namespace WheresMyMoney
 {
     public class NinjaItem
     {
