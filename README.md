@@ -1,4 +1,4 @@
-# Wheres My Money - ExileAPI Plugin
+# WheresMyMoney - ExileAPI Plugin
 
 A ground loot overlay for Path of Exile that shows you what's on the floor, 
 prices everything via poe.ninja, and tallies your currency per map.
@@ -15,7 +15,7 @@ prices everything via poe.ninja, and tallies your currency per map.
 
 ## Installation
 
-1. Drop the `Wheres-My-Money` folder into your `Plugins/Source/` directory.
+1. Drop the `WheresMyMoney` folder into your `Plugins/Source/` directory.
 2. Reload plugins in ExileAPI.
 3. Enable the plugin and set your league name in Settings (default: **Keepers**).
 
