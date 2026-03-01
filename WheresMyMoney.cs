@@ -15,11 +15,10 @@ namespace WheresMyMoney
         // ── State ─────────────────────────────────────────────────────────
         private readonly MapTally _tally = new MapTally();
 
-        // Ground items we saw last frame: entityId -> GroundItem
-        // Rebuilt from scratch every frame from ItemsOnGroundLabels.
+        // Ground items persist across frames — updated in-place, never replaced wholesale.
+        // This prevents a bad Mods-read frame from destroying previously good data.
         private Dictionary<uint, GroundItem> _lastFrameItems = new Dictionary<uint, GroundItem>();
 
-        // Known currency entity IDs for pickup detection
         private Dictionary<uint, (string name, int stack)> _trackedCurrencyEntities = new Dictionary<uint, (string, int)>();
 
         private string _currentLeague = "";
@@ -40,96 +39,193 @@ namespace WheresMyMoney
         }
 
         // ── Inventory snapshot ────────────────────────────────────────────
-        // We track the player's inventory each tick and diff against the previous
-        // snapshot to reliably detect pickups regardless of ground label behaviour.
         private Dictionary<string, int> _lastInventorySnapshot = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
         // ── Inner types ───────────────────────────────────────────────────
         private class GroundItem
         {
-            public uint EntityId;
-            public string Name;      // Full display name (may include magic/rare affixes)
-            public string BaseName;  // Clean base type name for poe.ninja lookup
-            public string Path;
-            public int ItemLevel;
+            public uint       EntityId;
+            public string     Name;        // Unique name or display name from label
+            public string     BaseName;    // Base type name for non-unique poe.ninja lookup
+            public string     Path;
+            public int        ItemLevel;
             public ItemRarity Rarity;
-            public int StackSize;
-            public float ChaosValue;
-            public bool IsCurrency;
-            public float DistanceToPlayer;
+            public int        StackSize;
+            public string     Influence;
+            public bool       IsCurrency;
+            public float      DistanceToPlayer;
+            public bool       ModsResolved; // true once we've had a valid Mods read
+
+            // ChaosValue is NOT stored here — it is always computed live from NinjaFetcher
+            // so that the moment prices load after a cold start, the correct value is used
+            // and items are not incorrectly hidden by the value threshold filter.
+        }
+
+        // ── Live chaos value lookup ───────────────────────────────────────
+        // Always call this instead of a cached field so the value reflects the
+        // current NinjaFetcher state regardless of when the item was first scanned.
+        private float GetLiveChaosValue(GroundItem i)
+        {
+            if (i.Rarity == ItemRarity.Unique)
+            {
+                float v = NinjaFetcher.GetChaosValue(i.Name);
+                if (v > 0f) return v;
+                return NinjaFetcher.GetBaseValue(i.BaseName, i.ItemLevel, i.Influence);
+            }
+            if (i.IsCurrency)
+                return NinjaFetcher.GetChaosValue(i.BaseName);
+            return NinjaFetcher.GetBaseValue(i.BaseName, i.ItemLevel, i.Influence);
         }
 
         // ── League list ───────────────────────────────────────────────────
-        // Dates are approximate — Keepers ends ~03/05/26, Mirage starts ~03/06/26.
-        // Entries with a future start date are hidden until that date; entries with
-        // a past end date are hidden after it. All times compared against system date.
         private static readonly (string Name, DateTime? ShowFrom, DateTime? HideAfter)[] LeagueOptions =
         {
-            ("Standard",          null,                          null),
-            ("Hardcore",          null,                          null),
-            ("Keepers",           null,                          new DateTime(2026, 3, 5)),
-            ("Hardcore Keepers",  null,                          new DateTime(2026, 3, 5)),
-            ("Mirage",            new DateTime(2026, 3, 6),      null),
-            ("Hardcore Mirage",   new DateTime(2026, 3, 6),      null),
+            ("Standard",         null,                     null),
+            ("Hardcore",         null,                     null),
+            ("Keepers",          null,                     new DateTime(2026, 3, 5)),
+            ("Hardcore Keepers", null,                     new DateTime(2026, 3, 5)),
+            ("Mirage",           new DateTime(2026, 3, 6), null),
+            ("Hardcore Mirage",  new DateTime(2026, 3, 6), null),
         };
 
         private static string[] GetVisibleLeagues()
         {
             var today = DateTime.Today;
-            var visible = new System.Collections.Generic.List<string>();
+            var visible = new List<string>();
             foreach (var (name, from, until) in LeagueOptions)
             {
-                if (from.HasValue && today < from.Value) continue;
+                if (from.HasValue  && today < from.Value)  continue;
                 if (until.HasValue && today > until.Value) continue;
                 visible.Add(name);
             }
             return visible.ToArray();
         }
 
-        // Draw a league dropdown at the top of the settings panel
+        // ── Settings UI ───────────────────────────────────────────────────
         public override void DrawSettings()
         {
+            // ── League ───────────────────────────────────────────────────
+            SectionHeader("League");
             var leagues = GetVisibleLeagues();
             var current = Settings.LeagueName.Value;
-
-            int idx = System.Array.IndexOf(leagues, current);
+            int idx = Array.IndexOf(leagues, current);
             if (idx < 0) idx = 0;
-
-            ImGui.Text("League");
-            ImGui.SameLine();
-            ImGui.SetNextItemWidth(200f);
+            ImGui.SetNextItemWidth(SliderWidth);
             if (ImGui.Combo("##league", ref idx, leagues, leagues.Length))
             {
                 Settings.LeagueName.Value = leagues[idx];
                 NinjaFetcher.ForceRefresh(leagues[idx]);
             }
 
-            ImGui.Spacing();
-            ImGui.Separator();
-            ImGui.Spacing();
+            // ── Currency on Ground ───────────────────────────────────────
+            SectionHeader("Currency on Ground");
+            var showCurrency = Settings.ShowCurrencyOverlay.Value;
+            if (ImGui.Checkbox("Show Currency on Ground##chk", ref showCurrency))
+                Settings.ShowCurrencyOverlay.Value = showCurrency;
+            ImGui.SameLine();
+            ImGui.TextDisabled("(?)");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show currency items currently on the ground");
+            DrawSteppedSlider("Minimum Value##currency",    Settings.MinCurrencyValue,  0f, 100f, 0.5f);
+            DrawIntSlider    ("Max Distance##currency",     Settings.CurrencyMaxDistance, "0 = unlimited");
 
-            // Draw the rest of the auto-generated settings
-            base.DrawSettings();
+            // ── Valuable Bases ───────────────────────────────────────────
+            SectionHeader("Valuable Bases");
+            var showBases = Settings.ShowBasesOverlay.Value;
+            if (ImGui.Checkbox("Show Valuable Bases##chk", ref showBases))
+                Settings.ShowBasesOverlay.Value = showBases;
+            ImGui.SameLine();
+            ImGui.TextDisabled("(?)");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show rare/magic item bases with good ilvl and chaos value");
+            DrawSteppedSlider("Minimum Value##bases",       Settings.MinBaseValue,       0f, 500f, 0.5f);
+            DrawIntSlider    ("Min Item Level##bases",      Settings.MinItemLevel,       "Minimum ilvl to consider a base valuable");
+            DrawIntSlider    ("Max Distance##bases",        Settings.BasesMaxDistance,   "0 = unlimited");
 
-            // Override the chaos value sliders with 0.5-increment versions
-            ImGui.Spacing();
-            ImGui.Separator();
-            ImGui.TextColored(new Vector4(1f, 0.85f, 0.1f, 1f), "Chaos Value Thresholds");
-            ImGui.Separator();
+            // ── Map Tally ────────────────────────────────────────────────
+            SectionHeader("Map Tally");
+            var showTally = Settings.ShowMapTally.Value;
+            if (ImGui.Checkbox("Show Map Tally##chk", ref showTally))
+                Settings.ShowMapTally.Value = showTally;
+            ImGui.SameLine();
+            ImGui.TextDisabled("(?)");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show per-map currency pickup tally");
+            DrawSteppedSlider("Minimum Value##tally",       Settings.TallyMinValue,      0f, 50f,  0.5f);
 
-            DrawSteppedSlider("Minimum Currency Value##stepped", Settings.MinCurrencyValue, 0f, 100f, 0.5f);
-            DrawSteppedSlider("Minimum Item Base Value##stepped",     Settings.MinBaseValue,     0f, 500f, 0.5f);
-            DrawSteppedSlider("Left Behind Currency Minimum Value##stepped", Settings.LeftBehindMinValue, 0f, 100f, 0.5f);
-            DrawSteppedSlider("Total Item Pickups Minimum Value##stepped",    Settings.TallyMinValue,    0f, 50f,  0.5f);
+            // ── Left Behind ──────────────────────────────────────────────
+            SectionHeader("Left Behind");
+            var showLeft = Settings.ShowLeftBehind.Value;
+            if (ImGui.Checkbox("Show Left Behind##chk", ref showLeft))
+                Settings.ShowLeftBehind.Value = showLeft;
+            ImGui.SameLine();
+            ImGui.TextDisabled("(?)");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Remind you of currency you walked away from this map");
+            DrawSteppedSlider("Minimum Value##leftbehind",  Settings.LeftBehindMinValue, 0f, 100f, 0.5f);
+
+            // ── Blocked Items ────────────────────────────────────────────
+            SectionHeader("Blocked Items");
+            ImGui.TextDisabled("Comma-separated names to exclude from tally and left behind");
+            var blockedStr = Settings.BlockedItems.Value ?? "";
+            ImGui.SetNextItemWidth(-1f);
+            if (ImGui.InputText("##blockeditems", ref blockedStr, 512))
+                Settings.BlockedItems.Value = blockedStr;
+
+            // ── Overlay Position ─────────────────────────────────────────
+            SectionHeader("Overlay Position");
+            DrawIntSlider("X Position##pos",   Settings.OverlayX,     "");
+            DrawIntSlider("Y Position##pos",   Settings.OverlayY,     "");
+            DrawIntSlider("Width##pos",        Settings.OverlayWidth, "");
+
+            // ── Visibility ───────────────────────────────────────────────
+            SectionHeader("Visibility");
+            var showTown    = Settings.ShowInTown.Value;
+            var showHideout = Settings.ShowInHideout.Value;
+            if (ImGui.Checkbox("Show in Town##chk",    ref showTown))    Settings.ShowInTown.Value    = showTown;
+            ImGui.SameLine();
+            ImGui.TextDisabled("(?)");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show the overlay while in town areas");
+            if (ImGui.Checkbox("Show in Hideout##chk", ref showHideout)) Settings.ShowInHideout.Value = showHideout;
+            ImGui.SameLine();
+            ImGui.TextDisabled("(?)");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show the overlay while in your hideout");
+
+            // ── Debug ────────────────────────────────────────────────────
+            SectionHeader("Debug");
+            var showDebug = Settings.ShowDebug.Value;
+            if (ImGui.Checkbox("Debug Mode##chk", ref showDebug))
+                Settings.ShowDebug.Value = showDebug;
+            ImGui.SameLine();
+            ImGui.TextDisabled("(?)");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show raw scan data in the overlay to diagnose issues");
         }
+
+        private static void SectionHeader(string title)
+        {
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(1f, 0.85f, 0.1f, 1f), title);
+            ImGui.Separator();
+        }
+
+        private static void DrawIntSlider(string label, ExileCore.Shared.Nodes.RangeNode<int> node, string tooltip)
+        {
+            int val = node.Value;
+            ImGui.SetNextItemWidth(SliderWidth);
+            if (ImGui.SliderInt(label, ref val, node.Min, node.Max))
+                node.Value = val;
+            if (!string.IsNullOrEmpty(tooltip))
+            {
+                ImGui.SameLine();
+                ImGui.TextDisabled("(?)");
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(tooltip);
+            }
+        }
+
+        private const float SliderWidth = 300f;
 
         private static void DrawSteppedSlider(string label, ExileCore.Shared.Nodes.RangeNode<float> node, float min, float max, float step)
         {
             float val = node.Value;
-            ImGui.SetNextItemWidth(200f);
+            ImGui.SetNextItemWidth(SliderWidth);
             if (ImGui.SliderFloat(label, ref val, min, max, $"{val:0.0}c"))
             {
-                // Snap to nearest step increment
                 val = (float)Math.Round(val / step) * step;
                 val = Math.Max(min, Math.Min(max, val));
                 node.Value = val;
@@ -139,10 +235,8 @@ namespace WheresMyMoney
         // ── Lifecycle ─────────────────────────────────────────────────────
         public override bool Initialise()
         {
-            // Validate the saved league name against the current visible list.
-            // If it's not in the list (e.g. league ended), reset to the first available league.
             var visible = GetVisibleLeagues();
-            if (visible.Length > 0 && System.Array.IndexOf(visible, Settings.LeagueName.Value) < 0)
+            if (visible.Length > 0 && Array.IndexOf(visible, Settings.LeagueName.Value) < 0)
                 Settings.LeagueName.Value = visible[0];
 
             _currentLeague = Settings.LeagueName.Value;
@@ -154,7 +248,6 @@ namespace WheresMyMoney
         {
             if (!Settings.Enable.Value) return null;
 
-            // Refresh prices if league changed in settings
             if (Settings.LeagueName.Value != _currentLeague)
             {
                 _currentLeague = Settings.LeagueName.Value;
@@ -165,29 +258,29 @@ namespace WheresMyMoney
                 NinjaFetcher.TryRefresh(_currentLeague);
             }
 
-            // Check for area change (resets tally)
             try
             {
                 var areaName = GameController.Area.CurrentArea?.DisplayName ?? "";
                 if (_tally.CheckArea(areaName))
-                    _lastInventorySnapshot.Clear(); // reset baseline on new map
+                {
+                    _lastInventorySnapshot.Clear();
+                    _lastFrameItems.Clear();
+                }
             }
             catch { }
 
-            // Check inventory for pickups (more reliable than ground label diffing)
             CheckInventoryForPickups();
-
-            // Scan ground items
             ScanGroundItems();
 
             return null;
         }
 
         // ── Inventory scanning ────────────────────────────────────────────
+        // For uniques the tally key must be the unique name ("Headhunter") not the
+        // base type ("Leather Belt"), otherwise poe.ninja returns 0 and the pickup
+        // is ignored. We resolve the unique name by matching the item's base type
+        // against ground items already identified in _lastFrameItems.
 
-        /// <summary>
-        /// Reads the player's main inventory via ServerData — works without the UI panel open.
-        /// </summary>
         private Dictionary<string, int> GetInventorySnapshot()
         {
             var snapshot = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -196,8 +289,7 @@ namespace WheresMyMoney
                 var inventories = GameController.Game.IngameState.ServerData.PlayerInventories;
                 if (inventories == null) return snapshot;
 
-                var mainInv = inventories
-                    .FirstOrDefault(x => x?.Inventory?.InventType == InventoryTypeE.MainInventory);
+                var mainInv = inventories.FirstOrDefault(x => x?.Inventory?.InventType == InventoryTypeE.MainInventory);
                 if (mainInv?.Inventory?.Items == null) return snapshot;
 
                 foreach (var item in mainInv.Inventory.Items)
@@ -206,17 +298,31 @@ namespace WheresMyMoney
                     {
                         if (item == null || !item.IsValid) continue;
 
-                        var baseComp = item.GetComponent<Base>();
-                        var name = baseComp?.Name ?? "";
-                        if (string.IsNullOrEmpty(name)) continue;
+                        var baseName = item.GetComponent<Base>()?.Name ?? "";
+                        if (string.IsNullOrEmpty(baseName)) continue;
 
-                        var stackComp = item.GetComponent<Stack>();
-                        int stack = stackComp?.Size ?? 1;
+                        int stack = item.GetComponent<Stack>()?.Size ?? 1;
 
-                        if (snapshot.ContainsKey(name))
-                            snapshot[name] += stack;
-                        else
-                            snapshot[name] = stack;
+                        // Default tally key is the base name; override for uniques.
+                        string tallyKey = baseName;
+                        try
+                        {
+                            var modsComp = item.GetComponent<Mods>();
+                            if (modsComp?.ItemRarity == ItemRarity.Unique)
+                            {
+                                // Look up the unique name from ground items we already resolved.
+                                var resolved = _lastFrameItems.Values.FirstOrDefault(
+                                    gi => gi.Rarity == ItemRarity.Unique
+                                       && gi.BaseName.Equals(baseName, StringComparison.OrdinalIgnoreCase)
+                                       && !string.IsNullOrEmpty(gi.Name));
+                                if (resolved != null)
+                                    tallyKey = resolved.Name;
+                            }
+                        }
+                        catch { }
+
+                        if (snapshot.ContainsKey(tallyKey)) snapshot[tallyKey] += stack;
+                        else snapshot[tallyKey] = stack;
                     }
                     catch { }
                 }
@@ -225,10 +331,6 @@ namespace WheresMyMoney
             return snapshot;
         }
 
-        /// <summary>
-        /// Diffs current inventory against last snapshot.
-        /// Any item whose count increased is recorded as a pickup.
-        /// </summary>
         private void CheckInventoryForPickups()
         {
             var current = GetInventorySnapshot();
@@ -239,12 +341,14 @@ namespace WheresMyMoney
                 if (blocked.Contains(kvp.Key)) continue;
                 _lastInventorySnapshot.TryGetValue(kvp.Key, out int previous);
                 int gained = kvp.Value - previous;
+                if (gained <= 0) continue;
+
+                // Try unique/currency name lookup first, fall back to base-type lookup.
                 float chaosVal = NinjaFetcher.GetChaosValue(kvp.Key);
-                if (gained > 0 && chaosVal >= Settings.MinBaseValue.Value)
-                {
-                    bool cap = _tally.GroundSeen.ContainsKey(kvp.Key);
-                    _tally.RecordInventoryPickup(kvp.Key, gained, cap);
-                }
+                if (chaosVal <= 0f) chaosVal = NinjaFetcher.GetBaseValue(kvp.Key, 0, "");
+
+                if (chaosVal >= Settings.MinBaseValue.Value)
+                    _tally.RecordInventoryPickup(kvp.Key, gained, _tally.GroundSeen.ContainsKey(kvp.Key));
             }
 
             _lastInventorySnapshot = current;
@@ -257,19 +361,17 @@ namespace WheresMyMoney
 
         private void ScanGroundItems()
         {
-            var currentItems = new Dictionary<uint, GroundItem>();
-            var debugLines   = new List<string>();
+            var seenThisFrame = new HashSet<uint>();
+            var debugLines    = new List<string>();
 
             try
             {
-                var ingameUi = GameController.Game.IngameState.IngameUi;
-                var labels   = ingameUi.ItemsOnGroundLabels;
+                var labels = GameController.Game.IngameState.IngameUi.ItemsOnGroundLabels;
                 if (labels == null)
                 {
                     debugLines.Add("ItemsOnGroundLabels is NULL");
                     DebugLines = debugLines;
-                    // Always replace so stale entries never linger across frames
-                    _lastFrameItems = currentItems;
+                    _lastFrameItems.Clear();
                     return;
                 }
 
@@ -278,9 +380,8 @@ namespace WheresMyMoney
                 Vector2 playerPos = Vector2.Zero;
                 try
                 {
-                    var playerRender = GameController.Player?.GetComponent<Render>();
-                    if (playerRender != null)
-                        playerPos = new Vector2(playerRender.Pos.X, playerRender.Pos.Y);
+                    var pr = GameController.Player?.GetComponent<Render>();
+                    if (pr != null) playerPos = new Vector2(pr.Pos.X, pr.Pos.Y);
                 }
                 catch { }
 
@@ -289,49 +390,37 @@ namespace WheresMyMoney
                     try
                     {
                         var item = label?.ItemOnGround;
-                        if (item == null || !item.IsValid)
-                        {
-                            debugLines.Add("  Skipped: item null or invalid");
-                            continue;
-                        }
+                        if (item == null || !item.IsValid) { debugLines.Add("  Skipped: null/invalid"); continue; }
 
-                        // Skip non-item ground objects — chests, terrain, waypoints, area transitions.
                         var groundPath = item.Path ?? "";
-                        if (groundPath.Contains("/Chests/")
-                         || groundPath.Contains("/Terrain/")
-                         || groundPath.Contains("/Waypoint")
-                         || groundPath.Contains("/AreaTransition"))
+                        if (groundPath.Contains("/Chests/") || groundPath.Contains("/Terrain/")
+                         || groundPath.Contains("/Waypoint") || groundPath.Contains("/AreaTransition"))
                         {
                             debugLines.Add($"  Skipped (non-item): {groundPath}");
                             continue;
                         }
 
-                        // Only process actual item drops that have a WorldItem component.
                         var worldItemComp = item.GetComponent<WorldItem>();
-                        if (worldItemComp == null)
-                        {
-                            debugLines.Add($"  Skipped (no WorldItem): {groundPath}");
-                            continue;
-                        }
+                        if (worldItemComp == null) { debugLines.Add($"  Skipped (no WorldItem): {groundPath}"); continue; }
 
                         var itemEntity = worldItemComp.ItemEntity;
-                        if (itemEntity == null || !itemEntity.IsValid)
-                        {
-                            debugLines.Add($"  Skipped (WorldItem entity null/invalid): {groundPath}");
-                            continue;
-                        }
+                        if (itemEntity == null || !itemEntity.IsValid) { debugLines.Add($"  Skipped (entity invalid): {groundPath}"); continue; }
 
-                        var itemPath = itemEntity.Path ?? groundPath;
+                        uint entityId = item.Id;
+                        seenThisFrame.Add(entityId);
 
-                        debugLines.Add($"  GroundPath: {groundPath} | ItemPath: {itemPath}");
+                        var itemPath  = itemEntity.Path ?? groundPath;
+                        var labelText = label.Label?.Text ?? "";
 
-                        // Name: label text is most reliable.
-                        // Strip leading stack prefix e.g. "20x Orb of Fusing" -> "Orb of Fusing"
-                        var labelText  = label.Label?.Text ?? "";
-                        var stackMatch = StackPrefixRegex.Match(labelText);
+                        // Unique item labels are multiline: first line is the unique name,
+                        // second line is the base type (e.g. "Headhunter\nLeather Belt").
+                        // Always take only the first line so we look up "Headhunter" not
+                        // "Headhunter\nLeather Belt" which returns 0 from poe.ninja.
+                        var firstLine  = labelText.Split('\n')[0].Trim();
+                        var stackMatch = StackPrefixRegex.Match(firstLine);
                         var itemName   = stackMatch.Success
-                            ? labelText.Substring(stackMatch.Length).Trim()
-                            : labelText.Trim();
+                            ? firstLine.Substring(stackMatch.Length).Trim()
+                            : firstLine;
 
                         if (string.IsNullOrEmpty(itemName))
                         {
@@ -339,21 +428,66 @@ namespace WheresMyMoney
                             itemName = parts.Length > 0 ? parts[parts.Length - 1] : itemPath;
                         }
 
+                        debugLines.Add($"  GroundPath: {groundPath} | ItemPath: {itemPath}");
                         debugLines.Add($"    Name: '{itemName}' | LabelText: '{labelText}'");
 
-                        // Rarity + ItemLevel
-                        var modsComp  = itemEntity.GetComponent<Mods>();
-                        var rarity    = modsComp?.ItemRarity ?? ItemRarity.Normal;
-                        int itemLevel = modsComp?.ItemLevel ?? 0;
+                        // ── Mods — carry forward on bad frames ────────────
+                        // The Mods component can return Normal/0 for several frames after
+                        // an item appears. We keep the last confirmed-good read so the item
+                        // does not flicker or get incorrectly filtered while Mods resolves.
+                        _lastFrameItems.TryGetValue(entityId, out var existing);
 
-                        // Stack size: prefer the Stack component; fall back to the label prefix
-                        var stackComp = itemEntity?.GetComponent<Stack>();
-                        int stackSize = stackComp?.Size ?? 1;
+                        var modsComp = itemEntity.GetComponent<Mods>();
+                        var rawRarity = modsComp?.ItemRarity ?? ItemRarity.Normal;
+                        int rawIlvl   = modsComp?.ItemLevel  ?? 0;
+                        bool modsGoodThisFrame = modsComp != null && (rawRarity != ItemRarity.Normal || rawIlvl > 0);
+
+                        ItemRarity rarity;
+                        int        itemLevel;
+                        string     influence;
+                        bool       modsResolved;
+
+                        if (existing != null && existing.ModsResolved && !modsGoodThisFrame)
+                        {
+                            // Keep previously confirmed values — Mods is unreliable this frame
+                            rarity       = existing.Rarity;
+                            itemLevel    = existing.ItemLevel;
+                            influence    = existing.Influence;
+                            modsResolved = true;
+                        }
+                        else
+                        {
+                            rarity    = rawRarity;
+                            itemLevel = rawIlvl;
+                            influence = "";
+                            try
+                            {
+                                if (modsComp != null)
+                                {
+                                    var allMods = modsComp.ItemMods?.Select(m => m.Name ?? "").ToList()
+                                                 ?? new List<string>();
+                                    bool HasMod(string p) =>
+                                        allMods.Any(m => m.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+
+                                    if      (HasMod("ShaperItem"))   influence = "Shaper";
+                                    else if (HasMod("ElderItem"))    influence = "Elder";
+                                    else if (HasMod("CrusaderItem")) influence = "Crusader";
+                                    else if (HasMod("HunterItem"))   influence = "Hunter";
+                                    else if (HasMod("RedeemerItem")) influence = "Redeemer";
+                                    else if (HasMod("WarlordItem"))  influence = "Warlord";
+                                }
+                            }
+                            catch { }
+                            modsResolved = modsGoodThisFrame;
+                        }
+
+                        // ── Stack size ────────────────────────────────────
+                        int stackSize = itemEntity.GetComponent<Stack>()?.Size ?? 1;
                         if (stackSize <= 1 && stackMatch.Success
-                            && int.TryParse(stackMatch.Groups[1].Value, out int parsedStack))
-                            stackSize = parsedStack;
+                            && int.TryParse(stackMatch.Groups[1].Value, out int ps))
+                            stackSize = ps;
 
-                        // Currency detection uses the resolved item path
+                        // ── Currency detection ────────────────────────────
                         bool isCurrency = itemPath.Contains("/Currency/")
                                        || itemPath.Contains("/Stackable/")
                                        || itemPath.Contains("/DivinationCard")
@@ -368,84 +502,74 @@ namespace WheresMyMoney
                                        || itemPath.Contains("/AtlasUpgrades")
                                        || itemPath.Contains("/Maps/");
 
-                        debugLines.Add($"    IsCurrency: {isCurrency} | Stack: {stackSize} | Rarity: {rarity} | iLvl: {itemLevel} | ModsFound: {modsComp != null}");
+                        debugLines.Add($"    IsCurrency: {isCurrency} | Stack: {stackSize} | Rarity: {rarity} | iLvl: {itemLevel} | ModsResolved: {modsResolved}");
 
-                        // For non-currency items, use the Base component name (strips magic/rare affixes)
-                        // so poe.ninja lookup finds "Accumulator Wand" not "Accumulator Wand of the Hyperboreal"
+                        // ── Base name ─────────────────────────────────────
                         string baseName = itemName;
                         if (!isCurrency)
                         {
                             try
                             {
-                                var baseComp = itemEntity.GetComponent<Base>();
-                                if (!string.IsNullOrEmpty(baseComp?.Name))
-                                    baseName = baseComp.Name;
+                                var bc = itemEntity.GetComponent<Base>();
+                                if (!string.IsNullOrEmpty(bc?.Name)) baseName = bc.Name;
                             }
                             catch { }
                         }
 
-                        float chaosValue = NinjaFetcher.GetChaosValue(baseName);
-                        debugLines.Add($"    BaseName: '{baseName}' | ChaosValue: {chaosValue} | NinjaLoaded: {NinjaFetcher.IsLoaded}");
-
-                        // Distance to player (3D world coords)
+                        // ── Distance ──────────────────────────────────────
                         float distance = 0f;
                         try
                         {
-                            var renderComp = item.GetComponent<Render>();
-                            if (renderComp != null && playerPos != Vector2.Zero)
-                            {
-                                var itemPos = new Vector2(renderComp.Pos.X, renderComp.Pos.Y);
-                                distance = Vector2.Distance(playerPos, itemPos);
-                            }
+                            var rc = item.GetComponent<Render>();
+                            if (rc != null && playerPos != Vector2.Zero)
+                                distance = Vector2.Distance(playerPos, new Vector2(rc.Pos.X, rc.Pos.Y));
                         }
                         catch { }
 
-                        debugLines.Add($"    Dist: {distance:0.#}");
+                        debugLines.Add($"    BaseName: '{baseName}' | UniqueName: '{(rarity == ItemRarity.Unique ? itemName : "n/a")}' | Influence: '{influence}' | Dist: {distance:0.#}");
 
-                        var gi = new GroundItem
+                        _lastFrameItems[entityId] = new GroundItem
                         {
-                            EntityId         = item.Id,
+                            EntityId         = entityId,
                             Name             = itemName,
                             BaseName         = baseName,
                             Path             = itemPath,
                             ItemLevel        = itemLevel,
                             Rarity           = rarity,
                             StackSize        = stackSize,
-                            ChaosValue       = chaosValue,
+                            Influence        = influence,
                             IsCurrency       = isCurrency,
-                            DistanceToPlayer = distance
+                            DistanceToPlayer = distance,
+                            ModsResolved     = modsResolved,
                         };
 
-                        currentItems[item.Id] = gi;
-
                         if (isCurrency)
-                            _trackedCurrencyEntities[item.Id] = (itemName, stackSize);
+                            _trackedCurrencyEntities[entityId] = (itemName, stackSize);
                     }
-                    catch (Exception ex)
-                    {
-                        debugLines.Add($"  ERROR: {ex.Message}");
-                    }
+                    catch (Exception ex) { debugLines.Add($"  ERROR: {ex.Message}"); }
                 }
             }
-            catch (Exception ex)
-            {
-                debugLines.Add($"OUTER ERROR: {ex.Message}");
-            }
+            catch (Exception ex) { debugLines.Add($"OUTER ERROR: {ex.Message}"); }
+
+            // Evict items no longer in the label list (picked up or out of range)
+            foreach (var id in _lastFrameItems.Keys.Where(id => !seenThisFrame.Contains(id)).ToList())
+                _lastFrameItems.Remove(id);
 
             DebugLines = debugLines;
 
-            // Feed THIS frame's visible items (currency + valuable bases) into ground-seen.
-            var blocked = GetBlockedItems();
+            // Update ground-seen tally using live chaos values
+            var blocked      = GetBlockedItems();
             var minBaseValue = Settings.MinBaseValue.Value;
             _tally.UpdateGroundSeen(
-                currentItems.Values
+                _lastFrameItems.Values
                     .Where(i => !blocked.Contains(i.BaseName))
-                    .Where(i => i.IsCurrency || NinjaFetcher.GetChaosValue(i.BaseName) >= minBaseValue)
-                    .Select(i => (i.BaseName, i.StackSize))
+                    .Where(i => i.IsCurrency || (
+                        (i.Rarity == ItemRarity.Unique || i.ItemLevel == 0 || i.ItemLevel >= Settings.MinItemLevel.Value)
+                        && GetLiveChaosValue(i) >= minBaseValue))
+                    // Use the unique name as the tally key for uniques so GroundSeen stores
+                    // "Headhunter" not "Leather Belt" — matching what the pickup tally records.
+                    .Select(i => (i.Rarity == ItemRarity.Unique ? i.Name : i.BaseName, i.StackSize))
             );
-
-            // Always replace — never keep a stale dict across frames
-            _lastFrameItems = currentItems;
         }
 
         // ── Rendering ─────────────────────────────────────────────────────
@@ -453,61 +577,56 @@ namespace WheresMyMoney
         {
             if (!Settings.Enable.Value) return;
             if (!GameController.Game.IngameState.InGame) return;
-
-            // Don't show overlay if inventory/stash is open
+            try
+            {
+                var area = GameController.Area.CurrentArea;
+                if (area != null)
+                {
+                    if (area.IsTown    && !Settings.ShowInTown.Value)    return;
+                    if (area.IsHideout && !Settings.ShowInHideout.Value) return;
+                }
+            }
+            catch { }
             try
             {
                 var ui = GameController.Game.IngameState.IngameUi;
                 if (ui.InventoryPanel?.IsVisible == true) return;
-                if (ui.StashElement?.IsVisible == true) return;
+                if (ui.StashElement?.IsVisible    == true) return;
             }
             catch { }
-
             DrawOverlay();
         }
 
         private void DrawOverlay()
         {
-            var windowPos  = new Vector2(Settings.OverlayX.Value, Settings.OverlayY.Value);
-            var windowSize = new Vector2(Settings.OverlayWidth.Value, 0); // 0 = auto height
-
-            ImGui.SetNextWindowPos(windowPos, ImGuiCond.Always);
-            ImGui.SetNextWindowSize(windowSize, ImGuiCond.Always);
+            ImGui.SetNextWindowPos(new Vector2(Settings.OverlayX.Value, Settings.OverlayY.Value), ImGuiCond.Always);
+            ImGui.SetNextWindowSize(new Vector2(Settings.OverlayWidth.Value, 0), ImGuiCond.Always);
             ImGui.SetNextWindowBgAlpha(0.75f);
 
-            var flags = ImGuiWindowFlags.NoTitleBar
-                      | ImGuiWindowFlags.NoResize
-                      | ImGuiWindowFlags.NoScrollbar
-                      | ImGuiWindowFlags.NoInputs
-                      | ImGuiWindowFlags.NoCollapse
-                      | ImGuiWindowFlags.NoNav
+            var flags = ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize
+                      | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoInputs
+                      | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoNav
                       | ImGuiWindowFlags.NoFocusOnAppearing;
 
-            if (!ImGui.Begin("WheresMyMoney##overlay", flags))
-            {
-                ImGui.End();
-                return;
-            }
+            if (!ImGui.Begin("WheresMyMoney##overlay", flags)) { ImGui.End(); return; }
 
             bool anythingDrawn = false;
 
-            // ── Nearby Items (currency + valuable bases merged, sorted by total value) ─
+            // ── Nearby Items ──────────────────────────────────────────────
             if (Settings.ShowCurrencyOverlay.Value || Settings.ShowBasesOverlay.Value)
             {
-                var nearbyRows = new System.Collections.Generic.List<(string Label, float TotalValue, Vector4 Color)>();
+                var nearbyRows = new List<(string Label, float TotalValue, Vector4 Color)>();
 
                 if (Settings.ShowCurrencyOverlay.Value)
                 {
-                    var grouped = GetFilteredCurrencyItems()
-                        .GroupBy(i => i.Name)
-                        .Select(g => new { Name = g.Key, TotalStack = g.Sum(i => i.StackSize), ChaosEach = g.First().ChaosValue });
-
-                    foreach (var g in grouped)
+                    foreach (var g in GetFilteredCurrencyItems().GroupBy(i => i.Name))
                     {
-                        float  total    = g.ChaosEach * g.TotalStack;
-                        string stackStr = g.TotalStack > 1 ? $" x{g.TotalStack}" : "";
-                        string valueStr = g.ChaosEach >= 0.01f ? $"  ~{total:0.#}c" : "";
-                        nearbyRows.Add(($"  {g.Name}{stackStr}{valueStr}", total, GetValueColor(g.ChaosEach)));
+                        float cv    = GetLiveChaosValue(g.First());
+                        int   total = g.Sum(i => i.StackSize);
+                        float val   = cv * total;
+                        string s    = total > 1 ? $" x{total}" : "";
+                        string v    = cv >= 0.01f ? $"  ~{val:0.#}c" : "";
+                        nearbyRows.Add(($"  {g.Key}{s}{v}", val, GetValueColor(cv)));
                     }
                 }
 
@@ -515,9 +634,10 @@ namespace WheresMyMoney
                 {
                     foreach (var b in GetFilteredBaseItems())
                     {
-                        string ilvlStr  = b.ItemLevel > 0 ? $" [ilvl {b.ItemLevel}]" : "";
-                        string valueStr = b.ChaosValue >= 0.01f ? $"  ~{b.ChaosValue:0.#}c" : "";
-                        nearbyRows.Add(($"  {b.Name}{ilvlStr}{valueStr}", b.ChaosValue, GetRarityColor(b.Rarity)));
+                        float cv      = GetLiveChaosValue(b);
+                        string ilvlS  = b.ItemLevel > 0 ? $" [ilvl {b.ItemLevel}]" : "";
+                        string valS   = cv >= 0.01f ? $"  ~{cv:0.#}c" : "";
+                        nearbyRows.Add(($"  {b.Name}{ilvlS}{valS}", cv, GetRarityColor(b.Rarity)));
                     }
                 }
 
@@ -532,31 +652,21 @@ namespace WheresMyMoney
             }
 
             // ── Left behind ───────────────────────────────────────────────
-            // Items seen on the ground this map that you walked away from without picking up.
-            // "Visible right now" items are excluded — those show in Currency Nearby already.
             if (Settings.ShowLeftBehind.Value)
             {
                 var visibleNow = new HashSet<string>(
-                    _lastFrameItems.Values.Select(i => i.BaseName),
+                    _lastFrameItems.Values.Select(i => i.Rarity == ItemRarity.Unique ? i.Name : i.BaseName),
                     StringComparer.OrdinalIgnoreCase);
 
                 var leftBehind = _tally.GroundSeen
                     .Select(kvp => new
                     {
-                        Name       = kvp.Key,
-                        SeenCount  = kvp.Value,
-                        PickedUp   = _tally.Counts.TryGetValue(kvp.Key, out int p) ? p : 0,
-                        ValueEach  = NinjaFetcher.GetChaosValue(kvp.Key)
+                        Name      = kvp.Key,
+                        ValueEach = NinjaFetcher.GetChaosValue(kvp.Key),
+                        Remaining = kvp.Value - (_tally.Counts.TryGetValue(kvp.Key, out int p) ? p : 0)
                     })
-                    .Select(r => new
-                    {
-                        r.Name,
-                        r.ValueEach,
-                        Remaining  = r.SeenCount - r.PickedUp
-                    })
-                    .Where(r => r.Remaining > 0)                                          // not fully picked up
-                    .Where(r => !visibleNow.Contains(r.Name))                             // not currently nearby
-                    .Where(r => r.ValueEach * r.Remaining >= Settings.LeftBehindMinValue.Value)
+                    .Where(r => r.Remaining > 0 && !visibleNow.Contains(r.Name)
+                             && r.ValueEach * r.Remaining >= Settings.LeftBehindMinValue.Value)
                     .OrderByDescending(r => r.ValueEach * r.Remaining)
                     .ToList();
 
@@ -565,7 +675,6 @@ namespace WheresMyMoney
                     if (anythingDrawn) ImGui.Spacing();
                     ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), "Left Behind");
                     ImGui.Separator();
-
                     foreach (var item in leftBehind)
                     {
                         float  total    = item.ValueEach * item.Remaining;
@@ -573,32 +682,24 @@ namespace WheresMyMoney
                         string valStr   = item.ValueEach >= 0.01f ? $"  ~{total:0.#}c" : "";
                         ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), $"  {item.Name}{countStr}{valStr}");
                     }
-
                     anythingDrawn = true;
                 }
             }
 
             // ── Map tally ─────────────────────────────────────────────────
-            // Both Counts (picked up) and GroundSeen (seen on ground this map) persist
-            // for the whole map regardless of player distance. The tally never disappears.
             if (Settings.ShowMapTally.Value && (_tally.Counts.Count > 0 || _tally.GroundSeen.Count > 0))
             {
                 if (anythingDrawn) ImGui.Spacing();
-                ImGui.TextColored(new Vector4(0.6f, 1f, 0.6f, 1f), $"{_tally.CurrentArea}");
+                ImGui.TextColored(new Vector4(0.6f, 1f, 0.6f, 1f), _tally.CurrentArea);
                 ImGui.Separator();
 
-                // Merge picked-up and ground-seen into one combined view
                 var combined = new Dictionary<string, (int picked, int onGround)>(StringComparer.OrdinalIgnoreCase);
-
                 foreach (var kvp in _tally.Counts)
                     combined[kvp.Key] = (kvp.Value, 0);
-
                 foreach (var kvp in _tally.GroundSeen)
                 {
-                    combined.TryGetValue(kvp.Key, out var existing);
-                    // Only show as "on ground" what hasn't been picked up yet
-                    int stillOnGround = Math.Max(0, kvp.Value - existing.picked);
-                    combined[kvp.Key] = (existing.picked, stillOnGround);
+                    combined.TryGetValue(kvp.Key, out var ex);
+                    combined[kvp.Key] = (ex.picked, Math.Max(0, kvp.Value - ex.picked));
                 }
 
                 var tallyRows = combined
@@ -609,8 +710,8 @@ namespace WheresMyMoney
                         OnGround  = kvp.Value.onGround,
                         ValueEach = NinjaFetcher.GetChaosValue(kvp.Key)
                     })
-                    .Where(r => r.ValueEach * r.Picked >= Settings.TallyMinValue.Value
-                             || r.ValueEach * r.OnGround >= Settings.TallyMinValue.Value)
+                    .Where(r => r.ValueEach * r.Picked    >= Settings.TallyMinValue.Value
+                             || r.ValueEach * r.OnGround  >= Settings.TallyMinValue.Value)
                     .OrderByDescending(r => r.ValueEach * r.Picked)
                     .ThenByDescending(r => r.ValueEach * r.OnGround)
                     .ToList();
@@ -618,41 +719,36 @@ namespace WheresMyMoney
                 float mapTotal = 0f;
                 foreach (var row in tallyRows)
                 {
-                    float pickedTotal   = row.ValueEach * row.Picked;
-                    float onGroundTotal = row.ValueEach * row.OnGround;
-                    mapTotal += pickedTotal;
+                    float pt = row.ValueEach * row.Picked;
+                    float gt = row.ValueEach * row.OnGround;
+                    mapTotal += pt;
 
                     if (row.Picked > 0 && row.OnGround > 0)
                     {
-                        string pickedStr = row.Picked > 1 ? $" x{row.Picked}" : "";
-                        string valStr    = row.ValueEach >= 0.01f ? $"  = {pickedTotal:0.#}c" : "";
-                        ImGui.TextColored(new Vector4(0.9f, 0.9f, 0.9f, 1f), $"  {row.Name}{pickedStr}{valStr}");
-                        string groundStr = row.OnGround > 1 ? $" x{row.OnGround}" : "";
-                        ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f), $"    +{row.Name}{groundStr}  ~{onGroundTotal:0.#}c  [on ground]");
+                        ImGui.TextColored(new Vector4(0.9f, 0.9f, 0.9f, 1f),
+                            $"  {row.Name}{(row.Picked > 1 ? $" x{row.Picked}" : "")}{(row.ValueEach >= 0.01f ? $"  = {pt:0.#}c" : "")}");
+                        ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f),
+                            $"    +{row.Name}{(row.OnGround > 1 ? $" x{row.OnGround}" : "")}  ~{gt:0.#}c  [on ground]");
                     }
                     else if (row.OnGround > 0)
                     {
-                        string countStr = row.OnGround > 1 ? $" x{row.OnGround}" : "";
-                        string valStr   = row.ValueEach >= 0.01f ? $"  ~{onGroundTotal:0.#}c" : "";
-                        ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f), $"  {row.Name}{countStr}{valStr}  [on ground]");
+                        ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f),
+                            $"  {row.Name}{(row.OnGround > 1 ? $" x{row.OnGround}" : "")}  ~{gt:0.#}c  [on ground]");
                     }
                     else
                     {
-                        string countStr = row.Picked > 1 ? $" x{row.Picked}" : "";
-                        string valStr   = row.ValueEach >= 0.01f ? $"  = {pickedTotal:0.#}c" : "";
-                        ImGui.TextColored(new Vector4(0.9f, 0.9f, 0.9f, 1f), $"  {row.Name}{countStr}{valStr}");
+                        ImGui.TextColored(new Vector4(0.9f, 0.9f, 0.9f, 1f),
+                            $"  {row.Name}{(row.Picked > 1 ? $" x{row.Picked}" : "")}{(row.ValueEach >= 0.01f ? $"  = {pt:0.#}c" : "")}");
                     }
                 }
-
                 ImGui.Separator();
                 ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), $"  Total  ~{mapTotal:0.#}c");
             }
 
-            // Status / ninja price status
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), NinjaFetcher.StatusMessage);
 
-            // Debug section
+            // ── Debug ─────────────────────────────────────────────────────
             if (Settings.ShowDebug.Value)
             {
                 ImGui.Spacing();
@@ -665,7 +761,8 @@ namespace WheresMyMoney
                 foreach (var kvp in _tally.GroundSeen)
                 {
                     int picked = _tally.Counts.TryGetValue(kvp.Key, out int p) ? p : 0;
-                    ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1f), $"  {kvp.Key}: seen={kvp.Value} picked={picked} remaining={kvp.Value - picked}");
+                    ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1f),
+                        $"  {kvp.Key}: seen={kvp.Value} picked={picked} remaining={kvp.Value - picked}");
                 }
 
                 ImGui.Spacing();
@@ -678,16 +775,16 @@ namespace WheresMyMoney
         }
 
         // ── Filtering helpers ─────────────────────────────────────────────
+        // All filters use GetLiveChaosValue() so price changes take effect immediately.
 
         private List<GroundItem> GetFilteredCurrencyItems()
         {
             var blocked = GetBlockedItems();
             return _lastFrameItems.Values
-                .Where(i => i.IsCurrency)
-                .Where(i => !blocked.Contains(i.BaseName))
+                .Where(i => i.IsCurrency && !blocked.Contains(i.BaseName))
                 .Where(i => Settings.CurrencyMaxDistance.Value == 0 || i.DistanceToPlayer <= Settings.CurrencyMaxDistance.Value)
                 .GroupBy(i => i.BaseName)
-                .Where(g => !NinjaFetcher.IsLoaded || g.First().ChaosValue * g.Sum(i => i.StackSize) >= Settings.MinCurrencyValue.Value)
+                .Where(g => !NinjaFetcher.IsLoaded || GetLiveChaosValue(g.First()) * g.Sum(i => i.StackSize) >= Settings.MinCurrencyValue.Value)
                 .SelectMany(g => g)
                 .ToList();
         }
@@ -696,33 +793,28 @@ namespace WheresMyMoney
         {
             return _lastFrameItems.Values
                 .Where(i => !i.IsCurrency)
-                .Where(i => i.ItemLevel == 0 || i.ItemLevel >= Settings.MinItemLevel.Value)
-                .Where(i => !NinjaFetcher.IsLoaded || i.ChaosValue >= Settings.MinBaseValue.Value)
-                .Where(i => i.Rarity >= ItemRarity.Magic || i.ChaosValue >= Settings.MinBaseValue.Value)
+                .Where(i => i.Rarity == ItemRarity.Unique || i.ItemLevel == 0 || i.ItemLevel >= Settings.MinItemLevel.Value)
+                .Where(i => !NinjaFetcher.IsLoaded || GetLiveChaosValue(i) >= Settings.MinBaseValue.Value)
                 .Where(i => Settings.BasesMaxDistance.Value == 0 || i.DistanceToPlayer <= Settings.BasesMaxDistance.Value)
                 .ToList();
         }
 
         // ── Color helpers ─────────────────────────────────────────────────
-
-        private static Vector4 GetValueColor(float chaosValue)
+        private static Vector4 GetValueColor(float cv)
         {
-            if (chaosValue >= 100f) return new Vector4(1f, 0.2f, 0.2f, 1f);   // red
-            if (chaosValue >= 20f)  return new Vector4(1f, 0.65f, 0f, 1f);    // orange
-            if (chaosValue >= 5f)   return new Vector4(1f, 1f, 0.3f, 1f);     // yellow
-            if (chaosValue >= 1f)   return new Vector4(0.9f, 0.9f, 0.9f, 1f); // white
-            return new Vector4(0.5f, 0.5f, 0.5f, 1f);                          // grey
+            if (cv >= 100f) return new Vector4(1f, 0.2f, 0.2f, 1f);
+            if (cv >= 20f)  return new Vector4(1f, 0.65f, 0f, 1f);
+            if (cv >= 5f)   return new Vector4(1f, 1f, 0.3f, 1f);
+            if (cv >= 1f)   return new Vector4(0.9f, 0.9f, 0.9f, 1f);
+            return new Vector4(0.5f, 0.5f, 0.5f, 1f);
         }
 
-        private static Vector4 GetRarityColor(ItemRarity rarity)
+        private static Vector4 GetRarityColor(ItemRarity rarity) => rarity switch
         {
-            return rarity switch
-            {
-                ItemRarity.Unique => new Vector4(0.99f, 0.5f, 0.1f, 1f),
-                ItemRarity.Rare   => new Vector4(1f, 1f, 0.2f, 1f),
-                ItemRarity.Magic  => new Vector4(0.5f, 0.5f, 1f, 1f),
-                _                 => new Vector4(0.9f, 0.9f, 0.9f, 1f)
-            };
-        }
+            ItemRarity.Unique => new Vector4(0.99f, 0.5f, 0.1f, 1f),
+            ItemRarity.Rare   => new Vector4(1f, 1f, 0.2f, 1f),
+            ItemRarity.Magic  => new Vector4(0.5f, 0.5f, 1f, 1f),
+            _                 => new Vector4(0.9f, 0.9f, 0.9f, 1f)
+        };
     }
 }
