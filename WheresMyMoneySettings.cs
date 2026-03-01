@@ -67,6 +67,13 @@ namespace WheresMyMoney
         [Menu("Overlay Width")]
         public RangeNode<int> OverlayWidth { get; set; } = new RangeNode<int>(300, 100, 800);
 
+        // ── Visibility by area type ───────────────────────────────────────
+        [Menu("Show in Town", "Show the overlay while in town areas")]
+        public ToggleNode ShowInTown { get; set; } = new ToggleNode(false);
+
+        [Menu("Show in Hideout", "Show the overlay while in your hideout")]
+        public ToggleNode ShowInHideout { get; set; } = new ToggleNode(true);
+
         [Menu("Debug Mode", "Show raw scan data in the overlay to diagnose issues")]
         public ToggleNode ShowDebug { get; set; } = new ToggleNode(false);
     }
